@@ -54,7 +54,9 @@ export async function readChunk(
   const res = await fetch(
     `${API_URL}/api/sessions/${sessionId}/chunks?offset=${offset}&length=${length}`
   );
-  await handle<Response>(res);
+  if (!res.ok) {
+    await handle<unknown>(res);
+  }
   return new Uint8Array(await res.arrayBuffer());
 }
 

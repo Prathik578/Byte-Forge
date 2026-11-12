@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
-  ChevronUp,
   Download,
   FileWarning,
   Loader2,
@@ -23,8 +22,8 @@ import {
 } from "@/components/ui/resizable";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
+  deleteBytes,
   downloadFile,
-  getSessionMeta,
   insertBytes,
   readChunk,
   writeBytes,
@@ -59,12 +58,23 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
   const [saving, setSaving] = useState(false);
   const [goto, setGoto] = useState("");
   const [search, setSearch] = useState("");
+  const [insertValue, setInsertValue] = useState("");
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [isMobile, setIsMobile] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const editsRef = useRef<Map<number, PendingEdit>>(new Map());
   const [, forceRender] = useState(0);
-  const historyRef = useRef<{ offset: number; original: number }[]>([]);
-  const redoRef = useRef<{ offset: number; value: number }[]>([]);
+  const historyRef = useRef<{ offset: number; before: number; after: number }[]>([]);
+  const redoRef = useRef<{ offset: number; before: number; after: number }[]>([]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 767px)");
+    const update = () => setIsMobile(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
 
   const totalRows = Math.ceil(size / BYTES_PER_ROW);
 
@@ -118,7 +128,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.session_id, size, visibleRows.first, visibleRows.last]);
+  }, [session.session_id, size, visibleRows.first, visibleRows.last, refreshVersion]);
 
   const getByte = useCallback(
     (row: number, col: number): number | null => {
@@ -136,17 +146,15 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
   const applyEdit = useCallback(
     (offset: number, value: number) => {
       const existing = editsRef.current.get(offset);
-      if (!existing) {
-        const rowKey = Math.floor(offset / BYTES_PER_ROW);
-        const rowData = rows.get(rowKey);
-        const col = offset % BYTES_PER_ROW;
-        const original = rowData ? rowData[col] : 0;
-        editsRef.current.set(offset, { offset, original, current: value });
-        historyRef.current.push({ offset, original });
-      } else {
-        existing.current = value;
-        editsRef.current.set(offset, existing);
-      }
+      const rowData = rows.get(Math.floor(offset / BYTES_PER_ROW));
+      const before = existing?.current ?? rowData?.[offset % BYTES_PER_ROW];
+      if (before === undefined || before === value) return;
+      editsRef.current.set(offset, {
+        offset,
+        original: existing?.original ?? before,
+        current: value,
+      });
+      historyRef.current.push({ offset, before, after: value });
       redoRef.current = [];
       forceRender((n) => n + 1);
     },
@@ -154,7 +162,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
   );
 
   const saveEdits = useCallback(async () => {
-    if (editsRef.current.size === 0) return;
+    if (editsRef.current.size === 0) return true;
     setSaving(true);
     try {
       const entries = [...editsRef.current.values()];
@@ -162,7 +170,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       const runs: { offset: number; bytes: number[] }[] = [];
       for (const e of entries.sort((a, b) => a.offset - b.offset)) {
         const last = runs[runs.length - 1];
-        if (last && last.offset + last.bytes.length === e.offset) {
+        if (last && last.offset + last.bytes.length === e.offset && last.bytes.length < 65536) {
           last.bytes.push(e.current);
         } else {
           runs.push({ offset: e.offset, bytes: [e.current] });
@@ -175,25 +183,106 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       historyRef.current = [];
       redoRef.current = [];
       setRows(new Map());
+      setRefreshVersion((version) => version + 1);
       forceRender((n) => n + 1);
       toast.success(`Saved ${runs.length} change${runs.length === 1 ? "" : "s"}`);
+      return true;
     } catch (err) {
       toast.error(`Save failed: ${(err as Error).message}`);
+      return false;
     } finally {
       setSaving(false);
     }
   }, [session.session_id]);
 
-  const undo = useCallback(async () => {
+  const handleInsertBytes = useCallback(async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (editsRef.current.size > 0) {
+      toast.error("Save or undo staged edits before inserting bytes.");
+      return;
+    }
+    const compact = insertValue.replace(/\s/g, "");
+    if (!compact || compact.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(compact)) {
+      toast.error("Enter complete hex byte pairs, such as DE AD BE EF.");
+      return;
+    }
+    const bytes = compact.match(/[0-9a-fA-F]{2}/g)?.map((byte) => parseInt(byte, 16)) ?? [];
+    if (bytes.length > 65536) {
+      toast.error("You can insert up to 65,536 bytes at a time.");
+      return;
+    }
+    const offset = selectedOffset ?? size;
+    setSaving(true);
+    try {
+      const result = await insertBytes(session.session_id, offset, bytes);
+      setSize(result.size);
+      setRows(new Map());
+      setRefreshVersion((version) => version + 1);
+      historyRef.current = [];
+      redoRef.current = [];
+      setSelectedOffset(offset);
+      setInsertValue("");
+      toast.success(`Inserted ${bytes.length} byte${bytes.length === 1 ? "" : "s"}`);
+    } catch (err) {
+      toast.error(`Insert failed: ${(err as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }, [insertValue, selectedOffset, session.session_id, size]);
+
+  const handleDeleteByte = useCallback(async () => {
+    if (selectedOffset === null) return;
+    if (editsRef.current.size > 0) {
+      toast.error("Save or undo staged edits before deleting bytes.");
+      return;
+    }
+    const offset = selectedOffset;
+    setSaving(true);
+    try {
+      const result = await deleteBytes(session.session_id, offset, 1);
+      setSize(result.size);
+      setRows(new Map());
+      setRefreshVersion((version) => version + 1);
+      historyRef.current = [];
+      redoRef.current = [];
+      setSelectedOffset(result.size ? Math.min(offset, result.size - 1) : null);
+      toast.success("Deleted 1 byte");
+    } catch (err) {
+      toast.error(`Delete failed: ${(err as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  }, [selectedOffset, session.session_id]);
+
+  const undo = useCallback(() => {
     const last = historyRef.current.pop();
     if (!last) return;
     const edit = editsRef.current.get(last.offset);
-    if (edit) editsRef.current.delete(last.offset);
-    redoRef.current.push({ offset: last.offset, value: edit?.current ?? 0 });
+    if (edit) {
+      if (last.before === edit.original) editsRef.current.delete(last.offset);
+      else editsRef.current.set(last.offset, { ...edit, current: last.before });
+    }
+    redoRef.current.push(last);
     forceRender((n) => n + 1);
   }, []);
 
+  const redo = useCallback(() => {
+    const next = redoRef.current.pop();
+    if (!next) return;
+    const edit = editsRef.current.get(next.offset);
+    const rowData = rows.get(Math.floor(next.offset / BYTES_PER_ROW));
+    const original = edit?.original ?? rowData?.[next.offset % BYTES_PER_ROW];
+    if (original === undefined) return;
+    editsRef.current.set(next.offset, { offset: next.offset, original, current: next.after });
+    historyRef.current.push(next);
+    forceRender((n) => n + 1);
+  }, [rows]);
+
   const handleDownload = useCallback(async () => {
+    if (editsRef.current.size > 0) {
+      const saved = await saveEdits();
+      if (!saved) return;
+    }
     setSaving(true);
     try {
       await downloadFile(session.session_id, filename);
@@ -203,17 +292,22 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
     } finally {
       setSaving(false);
     }
-  }, [session.session_id, filename]);
+  }, [saveEdits, session.session_id, filename]);
 
   const handleGoTo = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
-      const value = parseInt(goto.replace(/^(0x)/i, ""), 16);
-      if (Number.isNaN(value)) {
+      const offsetText = goto.trim().replace(/^0x/i, "");
+      if (size === 0) {
+        toast.error("This file does not contain any bytes yet.");
+        return;
+      }
+      if (!/^[0-9a-f]+$/i.test(offsetText)) {
         toast.error("Enter a valid hex offset like 1A2B");
         return;
       }
-      const clamped = Math.min(value, Math.max(0, size - 1));
+      const value = parseInt(offsetText, 16);
+      const clamped = Math.min(value, size - 1);
       const row = Math.floor(clamped / BYTES_PER_ROW);
       const viewport = scrollRef.current?.querySelector(
         "[data-radix-scroll-area-viewport]"
@@ -229,34 +323,62 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
   const handleSearch = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
-      const q = search.trim();
-      if (!q) return;
-      // Search the loaded cache for hex or ASCII match
-      const hex = /^[0-9a-fA-F\s]+$/.test(q) && q.replace(/\s/g, "").length % 2 === 0
-        ? (q.match(/[0-9a-fA-F]{2}/g) || []).map((h) => parseInt(h, 16))
-        : [...q].map((c) => c.charCodeAt(0));
+      const query = search.trim();
+      if (!query) return;
+      const hexQuery = query.replace(/^0x/i, "");
+      const compactHex = hexQuery.replace(/\s/g, "");
+      const isHexQuery = /^0x/i.test(query) || (/^[0-9a-fA-F\s]+$/.test(query) && compactHex.length % 2 === 0);
+      if (isHexQuery && compactHex.length % 2 !== 0) {
+        toast.error("Hex searches must contain complete byte pairs, such as 0xDE AD.");
+        return;
+      }
+      const bytes = isHexQuery
+        ? (compactHex.match(/[0-9a-fA-F]{2}/g) || []).map((value) => parseInt(value, 16))
+        : Array.from(new TextEncoder().encode(query));
+      if (!bytes.length) return;
+      if (bytes.length > 65536) {
+        toast.error("Search values are limited to 65,536 bytes.");
+        return;
+      }
 
-      const allRows = [...rows.entries()].sort((a, b) => a[0] - b[0]);
-      for (const [rowKey, data] of allRows) {
-        outer: for (let i = 0; i < data.length; i++) {
-          for (let j = 0; j < hex.length; j++) {
-            if (data[i + j] !== hex[j]) continue outer;
+      const prefix = new Array(bytes.length).fill(0);
+      for (let index = 1, matched = 0; index < bytes.length; index++) {
+        while (matched > 0 && bytes[index] !== bytes[matched]) matched = prefix[matched - 1];
+        if (bytes[index] === bytes[matched]) matched++;
+        prefix[index] = matched;
+      }
+      let matched = 0;
+      for (let offset = 0; offset < size; offset += 65536) {
+        try {
+          const chunk = await readChunk(session.session_id, offset, Math.min(65536, size - offset));
+          for (const [editOffset, edit] of editsRef.current) {
+            if (editOffset >= offset && editOffset < offset + chunk.length) {
+              chunk[editOffset - offset] = edit.current;
+            }
           }
-          const found = rowKey * BYTES_PER_ROW + i;
-          const viewport = scrollRef.current?.querySelector(
-            "[data-radix-scroll-area-viewport]"
-          ) as HTMLDivElement | null;
-          if (viewport) {
-            viewport.scrollTop = Math.max(0, rowKey * ROW_HEIGHT - 200);
+          for (let index = 0; index < chunk.length; index++) {
+            while (matched > 0 && chunk[index] !== bytes[matched]) matched = prefix[matched - 1];
+            if (chunk[index] === bytes[matched]) matched++;
+            if (matched === bytes.length) {
+              const found = offset + index + 1 - bytes.length;
+              const rowKey = Math.floor(found / BYTES_PER_ROW);
+              const viewport = scrollRef.current?.querySelector(
+                "[data-radix-scroll-area-viewport]"
+              ) as HTMLDivElement | null;
+              if (viewport) viewport.scrollTop = Math.max(0, rowKey * ROW_HEIGHT - 200);
+              setSelectedOffset(found);
+              toast.success(`Found at offset ${toHexOffset(found)}`);
+              return;
+            }
           }
-          setSelectedOffset(found);
-          toast.success(`Found at offset ${toHexOffset(found)}`);
+        } catch (err) {
+          toast.error(`Search failed: ${(err as Error).message}`);
           return;
         }
       }
-      toast.error("Not found in the loaded region");
+      toast.error("No match found in this file");
     },
-    [search, rows]
+    [search, session.session_id, size]
   );
 
   const commitEdit = useCallback(() => {
@@ -297,6 +419,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
           <Input
             value={goto}
             onChange={(e) => setGoto(e.target.value)}
+            aria-label="Go to hexadecimal offset"
             placeholder="Go to offset…"
             className="h-8 w-40 font-mono text-xs"
           />
@@ -309,6 +432,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            aria-label="Search the entire file in hexadecimal or text"
             placeholder="Find hex or text…"
             className="h-8 w-44 font-mono text-xs"
           />
@@ -324,9 +448,20 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
           variant="ghost"
           className="h-8"
           onClick={undo}
-          disabled={dirtyCount === 0}
+          disabled={historyRef.current.length === 0}
+          aria-label="Undo last byte edit"
         >
           <Undo2 className="h-4 w-4 mr-1" /> Undo
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-8"
+          onClick={redo}
+          disabled={redoRef.current.length === 0}
+          aria-label="Redo byte edit"
+        >
+          <Redo2 className="h-4 w-4 mr-1" /> Redo
         </Button>
         <Button
           size="sm"
@@ -357,8 +492,8 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       </div>
 
       <div className="flex-1 min-h-0">
-        <ResizablePanelGroup direction="horizontal">
-          <ResizablePanel defaultSize={65} minSize={40}>
+        <ResizablePanelGroup direction={isMobile ? "vertical" : "horizontal"}>
+          <ResizablePanel defaultSize={isMobile ? 55 : 65} minSize={isMobile ? 35 : 40}>
             <ScrollArea
               ref={scrollRef}
               className="h-full w-full"
@@ -426,6 +561,14 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
                             );
                           })}
                         </div>
+                        <div aria-label="ASCII preview" className="ml-3 flex shrink-0 border-l pl-3 font-mono text-muted-foreground">
+                          {Array.from({ length: BYTES_PER_ROW }, (_, col) => {
+                            const off = rowOffset + col;
+                            if (off >= size) return null;
+                            const value = getByte(row, col);
+                            return <span key={col} className="w-[0.65rem] text-center">{value === null ? "·" : toAscii(value)}</span>;
+                          })}
+                        </div>
                       </div>
                     );
                   })}
@@ -434,7 +577,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
             </ScrollArea>
           </ResizablePanel>
           <ResizableHandle withHandle />
-          <ResizablePanel defaultSize={35} minSize={20}>
+          <ResizablePanel defaultSize={isMobile ? 45 : 35} minSize={20}>
             <div className="h-full flex flex-col p-4 gap-4 overflow-auto">
               <div>
                 <h3 className="text-sm font-medium mb-2">Selected byte</h3>
@@ -481,7 +624,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
                       setEditingValue(e.target.value.replace(/[^0-9a-fA-F]/g, ""))
                     }
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") {
+                      if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
                         e.preventDefault();
                         commitEdit();
                       }
@@ -501,12 +644,41 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
                 </div>
               )}
 
-              <div className="text-xs text-muted-foreground space-y-1">
-                <p>
-                  Edits are staged in the browser and applied to the file on the
-                  server when you press Save. Download gives you the modified
-                  file.
+              <form onSubmit={handleInsertBytes} className="flex flex-col gap-2 border-t pt-4">
+                <label htmlFor="insert-bytes" className="text-sm font-medium">Insert bytes</label>
+                <Input
+                  id="insert-bytes"
+                  value={insertValue}
+                  onChange={(event) => setInsertValue(event.target.value.replace(/[^0-9a-fA-F\s]/g, ""))}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+                      event.preventDefault();
+                      void handleInsertBytes(event);
+                    }
+                  }}
+                  placeholder="DE AD BE EF"
+                  className="font-mono text-xs"
+                  aria-describedby="insert-bytes-help"
+                />
+                <p id="insert-bytes-help" className="text-[11px] text-muted-foreground">
+                  Inserts at the selected offset, or at the end of the file.
                 </p>
+                <Button type="submit" size="sm" variant="outline" disabled={saving || !insertValue.trim()}>
+                  Insert bytes
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  onClick={handleDeleteByte}
+                  disabled={saving || selectedOffset === null || size === 0}
+                >
+                  Delete selected byte
+                </Button>
+              </form>
+
+              <div className="text-xs leading-5 text-muted-foreground">
+                Byte edits are staged until Save. Insert and delete apply immediately to the temporary server copy.
               </div>
             </div>
           </ResizablePanel>

@@ -6,23 +6,23 @@ import { Toaster } from '@/components/ui/sonner';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'ByteForge — Binary Hex Editor',
+  metadataBase: new URL(
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000'
+  ),
+  title: 'ByteForge — Binary file editor',
   description:
-    'Inspect and edit binary files in your browser. Upload, patch bytes in hex, and download the result.',
+    'Inspect, search, and patch binary files in a fast, private hex editor. Files are processed in memory and expire automatically.',
+  applicationName: 'ByteForge',
   openGraph: {
-    images: [
-      {
-        url: 'https://bolt.new/static/og_default.png',
-      },
-    ],
+    title: 'ByteForge — Binary file editor',
+    description: 'A fast, private workspace for inspecting and editing binary files.',
+    siteName: 'ByteForge',
+    type: 'website',
   },
   twitter: {
-    card: 'summary_large_image',
-    images: [
-      {
-        url: 'https://bolt.new/static/og_default.png',
-      },
-    ],
+    card: 'summary',
+    title: 'ByteForge — Binary file editor',
+    description: 'A fast, private workspace for inspecting and editing binary files.',
   },
 };
 
