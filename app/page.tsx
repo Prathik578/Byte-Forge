@@ -20,6 +20,8 @@ import { HexEditor } from "@/components/hex-editor";
 import { discardSession, uploadFile, SessionInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/hex";
 
+const MAX_UPLOAD_BYTES = 800 * 1024 * 1024;
+
 const highlights = [
   {
     icon: ScanSearch,
@@ -47,6 +49,10 @@ export default function Home() {
   const handleFile = useCallback(async (file: File) => {
     if (!file.size) {
       toast.error("Choose a file that contains data.");
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      toast.error("Files must be 800 MiB or smaller.");
       return;
     }
     setUploading(true);
@@ -133,7 +139,7 @@ export default function Home() {
                 {uploading ? <Loader2 className="size-5 animate-spin" aria-hidden="true" /> : <Upload className="size-5" aria-hidden="true" />}
               </div>
               <p className="text-sm font-semibold">{uploading ? "Preparing your workspace…" : dragging ? "Drop your file to begin" : "Drop a file to inspect"}</p>
-              <p className="mt-1.5 text-xs text-muted-foreground">Any file type · processed in memory · no account needed</p>
+              <p className="mt-1.5 text-xs text-muted-foreground">Any file type · up to 800 MiB · processed in memory</p>
               <input
                 ref={inputRef}
                 type="file"

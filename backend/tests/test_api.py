@@ -3,6 +3,7 @@ import io
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import DEFAULT_MAX_UPLOAD_BYTES, Settings
 from app.main import app
 from app.session_store import store
 
@@ -19,12 +20,25 @@ def _upload(client, data: bytes, filename="test.bin"):
     )
 
 
+def test_default_upload_limit(monkeypatch):
+    monkeypatch.delenv("BYTEFORGE_MAX_UPLOAD_BYTES", raising=False)
+    assert Settings().max_upload_bytes == DEFAULT_MAX_UPLOAD_BYTES == 800 * 1024 * 1024
+
+
+def test_upload_size_limit(client, monkeypatch):
+    monkeypatch.setattr(store, "_max_bytes", 4)
+    response = _upload(client, b"12345")
+    assert response.status_code == 413
+    assert response.json()["detail"] == "File too large"
+
+
 def test_health(client):
     res = client.get("/api/health")
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "ok"
     assert body["service"] == "byteforge-api"
+    assert body["max_upload_bytes"] == store._max_bytes
 
 
 def test_upload_and_meta(client):
