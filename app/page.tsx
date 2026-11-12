@@ -55,7 +55,10 @@ export default function Home() {
       setSession(info);
       toast.success(`Loaded ${info.filename} · ${formatBytes(info.size)}`);
     } catch (err) {
-      toast.error(`Upload failed: ${(err as Error).message}`);
+      const reason = err instanceof TypeError
+        ? "The ByteForge API could not be reached. Its service may be offline; try again shortly."
+        : (err as Error).message;
+      toast.error(`Upload failed: ${reason}`);
     } finally {
       setUploading(false);
     }
