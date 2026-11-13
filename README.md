@@ -1,9 +1,9 @@
 # ByteForge
 
-A browser-based binary (hex) editor. Upload any file, inspect its bytes in a
-virtualized hex grid, patch individual bytes in hex, and download the modified
-file. Files are processed in server memory only and expire automatically —
-nothing is written to disk.
+A browser-based binary (hex) editor. Upload files up to 800 MiB by default,
+inspect bytes in a paged, virtualized hex grid, patch bytes in hex, and download
+the modified file. Files are processed in server memory only and expire
+automatically — nothing is written to disk.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ nothing is written to disk.
 
 The frontend talks to the backend over REST. The backend holds uploaded files
 in process memory with a TTL; the frontend requests only the byte ranges it
-needs (4096-byte chunks) so even multi-hundred-MB files scroll smoothly.
+needs (4096-byte chunks). Large files are paged so browser scroll-height limits do not prevent access to later offsets.
 
 ## Project layout
 
@@ -26,7 +26,7 @@ backend/
   app/main.py               FastAPI app, CORS, health-check wiring
   app/routers/sessions.py   Upload, chunk read, write/insert/delete, download
   app/session_store.py      In-memory session store with TTL cleanup
-  tests/                    pytest suite (13 tests)
+  tests/                    pytest suite (15 tests)
 ```
 
 ## API endpoints
@@ -80,7 +80,7 @@ cd backend && .venv/bin/python -m pytest tests/ -q
    - **Start command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 4. Add environment variables (from `backend/.env.example`):
    - `BYTEFORGE_CORS_ORIGINS=https://your-frontend.vercel.app`
-   - `BYTEFORGE_MAX_UPLOAD_BYTES=536870912`
+   - `BYTEFORGE_MAX_UPLOAD_BYTES=838860800` (800 MiB)
    - `BYTEFORGE_SESSION_TTL_SECONDS=1800`
 5. Health-check path: `/api/health`.
 6. Deploy and note the service URL, e.g. `https://byteforge-api.onrender.com`.

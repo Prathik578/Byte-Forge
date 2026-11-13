@@ -1,12 +1,14 @@
 import os
 
+DEFAULT_MAX_UPLOAD_BYTES = 800 * 1024 * 1024
+
 
 class Settings:
     def __init__(self) -> None:
         # Comma-separated list of allowed origins, or "*" for any.
         self.cors_origins: str = os.getenv("BYTEFORGE_CORS_ORIGINS", "*")
         # Maximum upload size in bytes; "0" disables the limit (not recommended).
-        self.max_upload_bytes: int = int(os.getenv("BYTEFORGE_MAX_UPLOAD_BYTES", str(512 * 1024 * 1024)))
+        self.max_upload_bytes: int = int(os.getenv("BYTEFORGE_MAX_UPLOAD_BYTES", str(DEFAULT_MAX_UPLOAD_BYTES)))
         # Seconds of inactivity before an uploaded file is discarded.
         self.session_ttl_seconds: int = int(os.getenv("BYTEFORGE_SESSION_TTL_SECONDS", "1800"))
 

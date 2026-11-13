@@ -2,13 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  BookmarkPlus,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Code2,
+  Copy,
   Download,
   FileWarning,
   Loader2,
   LogOut,
   Redo2,
   Search,
+  Save,
   Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -20,7 +26,8 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
+import { cn } from "@/lib/utils";
 import {
   deleteBytes,
   downloadFile,
@@ -32,10 +39,19 @@ import {
 import { formatBytes, toAscii, toHex, toHexOffset } from "@/lib/hex";
 
 const ROW_HEIGHT = 22;
-const BYTES_PER_ROW = 16;
+const CACHE_BYTES_PER_ROW = 16;
 const VIEWPORT_ROWS = 40;
+const ROWS_PER_PAGE = 1000;
 const CHUNK = 4096;
 const CACHE_ROWS = 256; // rows held in memory around viewport
+
+function byteTypeColor(value: number): string {
+  if (value === 0) return "text-muted-foreground";
+  if (value === 0x09 || value === 0x0a || value === 0x0d || value === 0x20) return "text-sky-700";
+  if (value >= 0x21 && value <= 0x7e) return "text-emerald-700";
+  if (value < 0x20 || value === 0x7f) return "text-amber-700";
+  return "text-violet-700";
+}
 
 interface PendingEdit {
   offset: number;
@@ -46,13 +62,21 @@ interface PendingEdit {
 interface HexEditorProps {
   session: SessionInfo;
   onDiscard: () => void;
+  initialOffset?: number;
 }
 
-export function HexEditor({ session, onDiscard }: HexEditorProps) {
+export function HexEditor({ session, onDiscard, initialOffset }: HexEditorProps) {
   const [size, setSize] = useState(session.size);
   const [filename, setFilename] = useState(session.filename);
   const [rows, setRows] = useState<Map<number, Uint8Array>>(new Map());
   const [scrollTop, setScrollTop] = useState(0);
+  const [pageStartRow, setPageStartRow] = useState(0);
+  const [bytesPerRow, setBytesPerRow] = useState(16);
+  const [searchMode, setSearchMode] = useState<"hex" | "text">("hex");
+  const [colorCoding, setColorCoding] = useState(true);
+  const [bookmarks, setBookmarks] = useState<number[]>([]);
+  const [bookmarkSelection, setBookmarkSelection] = useState("");
+  const [searchMatchOffset, setSearchMatchOffset] = useState<number | null>(null);
   const [selectedOffset, setSelectedOffset] = useState<number | null>(null);
   const [editingValue, setEditingValue] = useState("");
   const [saving, setSaving] = useState(false);
@@ -67,6 +91,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
   const [, forceRender] = useState(0);
   const historyRef = useRef<{ offset: number; before: number; after: number }[]>([]);
   const redoRef = useRef<{ offset: number; before: number; after: number }[]>([]);
+  const initialOffsetHandledRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 767px)");
@@ -76,32 +101,42 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
     return () => media.removeEventListener("change", update);
   }, []);
 
-  const totalRows = Math.ceil(size / BYTES_PER_ROW);
+  const totalRows = Math.ceil(size / bytesPerRow);
+  const pageRowCount = Math.min(ROWS_PER_PAGE, Math.max(0, totalRows - pageStartRow));
+  const totalPages = Math.max(1, Math.ceil(totalRows / ROWS_PER_PAGE));
+  const currentPage = Math.floor(pageStartRow / ROWS_PER_PAGE);
 
   const visibleRows = useMemo(() => {
-    const first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 4);
-    const last = Math.min(totalRows, first + VIEWPORT_ROWS + 8);
+    const first = pageStartRow + Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 4);
+    const last = Math.min(pageStartRow + pageRowCount, first + VIEWPORT_ROWS + 8);
     return { first, last };
-  }, [scrollTop, totalRows]);
+  }, [pageRowCount, pageStartRow, scrollTop]);
+
+  useEffect(() => {
+    const viewport = scrollRef.current?.querySelector(
+      "[data-radix-scroll-area-viewport]"
+    ) as HTMLDivElement | null;
+    if (viewport && viewport.scrollTop !== scrollTop) viewport.scrollTop = scrollTop;
+  }, [pageStartRow, scrollTop]);
 
   // Load rows around viewport
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      const startRow = Math.floor(visibleRows.first * BYTES_PER_ROW / CHUNK) * CHUNK;
-      const endByte = Math.min(size, (visibleRows.last + 1) * BYTES_PER_ROW);
+      const startRow = Math.floor(visibleRows.first * bytesPerRow / CHUNK) * CHUNK;
+      const endByte = Math.min(size, visibleRows.last * bytesPerRow);
       const newRows = new Map<number, Uint8Array>();
       for (let off = startRow; off < endByte; off += CHUNK) {
-        const rowKey = Math.floor(off / BYTES_PER_ROW);
+        const rowKey = Math.floor(off / CACHE_BYTES_PER_ROW);
         if (rows.has(rowKey)) continue;
         const len = Math.min(CHUNK, size - off);
         try {
           const data = await readChunk(session.session_id, off, len);
           if (cancelled) return;
-          for (let i = 0; i < data.length; i += BYTES_PER_ROW) {
+          for (let i = 0; i < data.length; i += CACHE_BYTES_PER_ROW) {
             newRows.set(
-              Math.floor((off + i) / BYTES_PER_ROW),
-              data.slice(i, Math.min(i + BYTES_PER_ROW, data.length))
+              Math.floor((off + i) / CACHE_BYTES_PER_ROW),
+              data.slice(i, Math.min(i + CACHE_BYTES_PER_ROW, data.length))
             );
           }
         } catch (err) {
@@ -115,7 +150,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
         for (const [k, v] of newRows) merged.set(k, v);
         // Trim far-away rows
         if (merged.size > CACHE_ROWS * 2) {
-          const center = visibleRows.first;
+          const center = Math.floor(visibleRows.first * bytesPerRow / CACHE_BYTES_PER_ROW);
           for (const key of merged.keys()) {
             if (Math.abs(key - center) > CACHE_ROWS) merged.delete(key);
           }
@@ -128,26 +163,80 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.session_id, size, visibleRows.first, visibleRows.last, refreshVersion]);
+  }, [session.session_id, size, visibleRows.first, visibleRows.last, bytesPerRow, refreshVersion]);
 
   const getByte = useCallback(
-    (row: number, col: number): number | null => {
-      const rowKey = row;
+    (offset: number): number | null => {
+      const rowKey = Math.floor(offset / CACHE_BYTES_PER_ROW);
+      const col = offset % CACHE_BYTES_PER_ROW;
       const data = rows.get(rowKey);
       if (!data) return null;
-      const off = row * BYTES_PER_ROW + col;
-      const edit = editsRef.current.get(off);
+      const edit = editsRef.current.get(offset);
       if (edit) return edit.current;
-      return off - row * BYTES_PER_ROW < data.length ? data[col] : null;
+      return col < data.length ? data[col] : null;
     },
     [rows]
   );
 
+  const moveToOffset = useCallback((offset: number) => {
+    const row = Math.floor(offset / bytesPerRow);
+    const nextPageStart = Math.floor(row / ROWS_PER_PAGE) * ROWS_PER_PAGE;
+    setPageStartRow(nextPageStart);
+    setScrollTop(Math.max(0, (row - nextPageStart) * ROW_HEIGHT - 200));
+    setSelectedOffset(offset);
+  }, [bytesPerRow]);
+
+  useEffect(() => {
+    if (initialOffset === undefined || size === 0 || initialOffsetHandledRef.current === initialOffset) return;
+    initialOffsetHandledRef.current = initialOffset;
+    moveToOffset(Math.min(initialOffset, size - 1));
+  }, [initialOffset, moveToOffset, size]);
+
+  const changeBytesPerRow = useCallback((width: number) => {
+    if (width === bytesPerRow) return;
+    setBytesPerRow(width);
+    setRows(new Map());
+    setRefreshVersion((version) => version + 1);
+    const row = selectedOffset === null ? 0 : Math.floor(selectedOffset / width);
+    const nextPageStart = Math.floor(row / ROWS_PER_PAGE) * ROWS_PER_PAGE;
+    setPageStartRow(nextPageStart);
+    setScrollTop(Math.max(0, (row - nextPageStart) * ROW_HEIGHT - 200));
+  }, [bytesPerRow, selectedOffset]);
+
+  const addBookmark = useCallback(() => {
+    if (selectedOffset === null) {
+      toast.error("Select a byte before adding a bookmark.");
+      return;
+    }
+    setBookmarks((current) => [...new Set([...current, selectedOffset])].sort((a, b) => a - b));
+    setBookmarkSelection(String(selectedOffset));
+    toast.success(`Bookmarked ${toHexOffset(selectedOffset)}`);
+  }, [selectedOffset]);
+
+  const copyPermalink = useCallback(async () => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("session", session.session_id);
+    if (selectedOffset !== null) url.searchParams.set("offset", toHexOffset(selectedOffset));
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      toast.success("Permalink copied");
+    } catch {
+      toast.error("Could not copy the permalink in this browser.");
+    }
+  }, [selectedOffset, session.session_id]);
+
+  const changePage = useCallback((nextPage: number) => {
+    const lastPage = Math.max(0, Math.ceil(totalRows / ROWS_PER_PAGE) - 1);
+    const page = Math.max(0, Math.min(lastPage, nextPage));
+    setPageStartRow(page * ROWS_PER_PAGE);
+    setScrollTop(0);
+  }, [totalRows]);
+
   const applyEdit = useCallback(
     (offset: number, value: number) => {
       const existing = editsRef.current.get(offset);
-      const rowData = rows.get(Math.floor(offset / BYTES_PER_ROW));
-      const before = existing?.current ?? rowData?.[offset % BYTES_PER_ROW];
+      const rowData = rows.get(Math.floor(offset / CACHE_BYTES_PER_ROW));
+      const before = existing?.current ?? rowData?.[offset % CACHE_BYTES_PER_ROW];
       if (before === undefined || before === value) return;
       editsRef.current.set(offset, {
         offset,
@@ -220,7 +309,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       setRefreshVersion((version) => version + 1);
       historyRef.current = [];
       redoRef.current = [];
-      setSelectedOffset(offset);
+      moveToOffset(offset);
       setInsertValue("");
       toast.success(`Inserted ${bytes.length} byte${bytes.length === 1 ? "" : "s"}`);
     } catch (err) {
@@ -228,7 +317,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
     } finally {
       setSaving(false);
     }
-  }, [insertValue, selectedOffset, session.session_id, size]);
+  }, [insertValue, moveToOffset, selectedOffset, session.session_id, size]);
 
   const handleDeleteByte = useCallback(async () => {
     if (selectedOffset === null) return;
@@ -245,14 +334,15 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       setRefreshVersion((version) => version + 1);
       historyRef.current = [];
       redoRef.current = [];
-      setSelectedOffset(result.size ? Math.min(offset, result.size - 1) : null);
+      if (result.size > 0) moveToOffset(Math.min(offset, result.size - 1));
+      else setSelectedOffset(null);
       toast.success("Deleted 1 byte");
     } catch (err) {
       toast.error(`Delete failed: ${(err as Error).message}`);
     } finally {
       setSaving(false);
     }
-  }, [selectedOffset, session.session_id]);
+  }, [moveToOffset, selectedOffset, session.session_id]);
 
   const undo = useCallback(() => {
     const last = historyRef.current.pop();
@@ -270,8 +360,8 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
     const next = redoRef.current.pop();
     if (!next) return;
     const edit = editsRef.current.get(next.offset);
-    const rowData = rows.get(Math.floor(next.offset / BYTES_PER_ROW));
-    const original = edit?.original ?? rowData?.[next.offset % BYTES_PER_ROW];
+    const rowData = rows.get(Math.floor(next.offset / CACHE_BYTES_PER_ROW));
+    const original = edit?.original ?? rowData?.[next.offset % CACHE_BYTES_PER_ROW];
     if (original === undefined) return;
     editsRef.current.set(next.offset, { offset: next.offset, original, current: next.after });
     historyRef.current.push(next);
@@ -294,6 +384,40 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
     }
   }, [saveEdits, session.session_id, filename]);
 
+  const handleExportAsCode = useCallback(async () => {
+    const startOffset = pageStartRow * bytesPerRow;
+    const endOffset = Math.min(size, (pageStartRow + pageRowCount) * bytesPerRow);
+    const bytes: number[] = [];
+    try {
+      for (let offset = startOffset; offset < endOffset; offset += 65536) {
+        const chunk = await readChunk(session.session_id, offset, Math.min(65536, endOffset - offset));
+        for (const [editOffset, edit] of editsRef.current) {
+          if (editOffset >= offset && editOffset < offset + chunk.length) {
+            chunk[editOffset - offset] = edit.current;
+          }
+        }
+        for (const byte of chunk) bytes.push(byte);
+      }
+      const sourceRows: string[] = [];
+      for (let index = 0; index < bytes.length; index += 16) {
+        sourceRows.push(`  ${bytes.slice(index, index + 16).map((byte) => `0x${toHex(byte)}`).join(", ")}`);
+      }
+      const source = `export const startOffset = 0x${toHexOffset(startOffset)};\nexport const bytes = new Uint8Array([\n${sourceRows.join(",\n")}\n]);\n`;
+      const blob = new Blob([source], { type: "text/typescript" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${filename.replace(/\.[^.]+$/, "")}-page-${currentPage + 1}.ts`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast.success(`Exported page ${currentPage + 1} as TypeScript`);
+    } catch (err) {
+      toast.error(`Code export failed: ${(err as Error).message}`);
+    }
+  }, [bytesPerRow, currentPage, filename, pageRowCount, pageStartRow, session.session_id, size]);
+
   const handleGoTo = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
@@ -308,16 +432,10 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       }
       const value = parseInt(offsetText, 16);
       const clamped = Math.min(value, size - 1);
-      const row = Math.floor(clamped / BYTES_PER_ROW);
-      const viewport = scrollRef.current?.querySelector(
-        "[data-radix-scroll-area-viewport]"
-      ) as HTMLDivElement | null;
-      if (viewport) {
-        viewport.scrollTop = Math.max(0, row * ROW_HEIGHT - 200);
-      }
-      setSelectedOffset(clamped);
+      setSearchMatchOffset(null);
+      moveToOffset(clamped);
     },
-    [goto, size]
+    [goto, moveToOffset, size]
   );
 
   const handleSearch = useCallback(
@@ -325,14 +443,12 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       e.preventDefault();
       const query = search.trim();
       if (!query) return;
-      const hexQuery = query.replace(/^0x/i, "");
-      const compactHex = hexQuery.replace(/\s/g, "");
-      const isHexQuery = /^0x/i.test(query) || (/^[0-9a-fA-F\s]+$/.test(query) && compactHex.length % 2 === 0);
-      if (isHexQuery && compactHex.length % 2 !== 0) {
-        toast.error("Hex searches must contain complete byte pairs, such as 0xDE AD.");
+      const compactHex = query.replace(/^0x/i, "").replace(/\s/g, "");
+      if (searchMode === "hex" && (!compactHex || compactHex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(compactHex))) {
+        toast.error("Hex searches must contain complete byte pairs, such as DE AD BE EF.");
         return;
       }
-      const bytes = isHexQuery
+      const bytes = searchMode === "hex"
         ? (compactHex.match(/[0-9a-fA-F]{2}/g) || []).map((value) => parseInt(value, 16))
         : Array.from(new TextEncoder().encode(query));
       if (!bytes.length) return;
@@ -361,12 +477,8 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
             if (chunk[index] === bytes[matched]) matched++;
             if (matched === bytes.length) {
               const found = offset + index + 1 - bytes.length;
-              const rowKey = Math.floor(found / BYTES_PER_ROW);
-              const viewport = scrollRef.current?.querySelector(
-                "[data-radix-scroll-area-viewport]"
-              ) as HTMLDivElement | null;
-              if (viewport) viewport.scrollTop = Math.max(0, rowKey * ROW_HEIGHT - 200);
-              setSelectedOffset(found);
+              setSearchMatchOffset(found);
+              moveToOffset(found);
               toast.success(`Found at offset ${toHexOffset(found)}`);
               return;
             }
@@ -378,7 +490,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       }
       toast.error("No match found in this file");
     },
-    [search, session.session_id, size]
+    [moveToOffset, search, searchMode, session.session_id, size]
   );
 
   const commitEdit = useCallback(() => {
@@ -415,6 +527,23 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
           )}
         </div>
 
+        <div role="group" aria-label="Bytes per row" className="flex items-center gap-1">
+          <span className="mr-1 text-xs text-muted-foreground">Bytes per row</span>
+          {[8, 16, 32].map((width) => (
+            <Button
+              key={width}
+              type="button"
+              size="sm"
+              variant={bytesPerRow === width ? "default" : "outline"}
+              className="h-8 px-3"
+              aria-pressed={bytesPerRow === width}
+              onClick={() => changeBytesPerRow(width)}
+            >
+              {width}
+            </Button>
+          ))}
+        </div>
+
         <form onSubmit={handleGoTo} className="flex items-center gap-1">
           <Input
             value={goto}
@@ -429,17 +558,83 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
         </form>
 
         <form onSubmit={handleSearch} className="flex items-center gap-1">
+          <select
+            aria-label="Search mode"
+            value={searchMode}
+            onChange={(event) => setSearchMode(event.target.value as "hex" | "text")}
+            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+          >
+            <option value="hex">Hex</option>
+            <option value="text">Text</option>
+          </select>
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            aria-label="Search the entire file in hexadecimal or text"
-            placeholder="Find hex or text…"
+            aria-label={`Search file as ${searchMode}`}
+            placeholder={searchMode === "hex" ? "e.g. DE AD BE EF" : "Search text…"}
             className="h-8 w-44 font-mono text-xs"
           />
           <Button type="submit" size="sm" variant="ghost" className="h-8 px-2">
             <Search className="h-4 w-4" />
           </Button>
         </form>
+
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1"
+          onClick={addBookmark}
+          disabled={selectedOffset === null}
+        >
+          <BookmarkPlus className="size-4" /> Add Bookmark
+        </Button>
+        {bookmarks.length > 0 && (
+          <select
+            aria-label="Jump to bookmark"
+            value={bookmarkSelection}
+            onChange={(event) => {
+              setBookmarkSelection(event.target.value);
+              moveToOffset(Number(event.target.value));
+            }}
+            className="h-8 max-w-40 rounded-md border border-input bg-background px-2 text-xs"
+          >
+            <option value="" disabled>Bookmarks</option>
+            {bookmarks.map((offset) => (
+              <option key={offset} value={offset}>{toHexOffset(offset)}</option>
+            ))}
+          </select>
+        )}
+
+        {totalRows > ROWS_PER_PAGE && (
+          <div role="group" aria-label="Large file pages" className="flex h-8 items-center gap-1 rounded-md border px-1">
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 px-1.5"
+              aria-label="Previous row page"
+              onClick={() => changePage(currentPage - 1)}
+              disabled={currentPage === 0}
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <span aria-live="polite" className="whitespace-nowrap px-1 text-[11px] text-muted-foreground">
+              Page {currentPage + 1} of {totalPages}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 px-1.5"
+              aria-label="Next row page"
+              onClick={() => changePage(currentPage + 1)}
+              disabled={currentPage + 1 >= totalPages}
+            >
+              <ChevronRight className="size-4" />
+            </Button>
+          </div>
+        )}
 
         <div className="flex-1" />
 
@@ -470,7 +665,7 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
           onClick={saveEdits}
           disabled={saving || dirtyCount === 0}
         >
-          {saving ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Redo2 className="h-4 w-4 mr-1" />}
+          {saving ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Save className="h-4 w-4 mr-1" />}
           Save
         </Button>
         <Button
@@ -479,7 +674,13 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
           onClick={handleDownload}
           disabled={saving}
         >
-          <Download className="h-4 w-4 mr-1" /> Download
+          <Download className="h-4 w-4 mr-1" /> Export Modified
+        </Button>
+        <Button type="button" size="sm" variant="outline" className="h-8" onClick={handleExportAsCode}>
+          <Code2 className="mr-1 size-4" /> Export as Code
+        </Button>
+        <Button type="button" size="sm" variant="ghost" className="h-8" onClick={copyPermalink} disabled={selectedOffset === null}>
+          <Copy className="mr-1 size-4" /> Copy Permalink
         </Button>
         <Button
           size="sm"
@@ -494,9 +695,31 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
       <div className="flex-1 min-h-0">
         <ResizablePanelGroup direction={isMobile ? "vertical" : "horizontal"}>
           <ResizablePanel defaultSize={isMobile ? 55 : 65} minSize={isMobile ? 35 : 40}>
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="flex flex-col gap-2 border-b bg-background px-3 py-2 text-[11px] sm:px-4">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                <span className="mr-1 text-sm font-semibold text-foreground">Hex View</span>
+                <span className="font-medium text-muted-foreground">Selection legend</span>
+                <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm bg-amber-500" />Modified</span>
+                <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-500" />Search</span>
+                <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm bg-primary" />Selection</span>
+                <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm bg-fuchsia-500" />Bookmark</span>
+                <Button type="button" size="sm" variant="ghost" className="ml-auto h-6 px-2 text-[11px]" aria-pressed={colorCoding} onClick={() => setColorCoding((enabled) => !enabled)}>
+                  Color coding: {colorCoding ? "On" : "Off"}
+                </Button>
+              </div>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+                <span className="font-medium">Byte types</span>
+                <span><span className="font-mono text-muted-foreground">00</span> Null</span>
+                <span><span className="font-mono text-emerald-700">41</span> Printable</span>
+                <span><span className="font-mono text-amber-700">1F</span> Control</span>
+                <span><span className="font-mono text-sky-700">0A</span> Whitespace</span>
+                <span><span className="font-mono text-violet-700">FF</span> Extended</span>
+              </div>
+            </div>
             <ScrollArea
               ref={scrollRef}
-              className="h-full w-full"
+              className="min-h-0 w-full flex-1"
               onScrollCapture={(e: React.UIEvent<HTMLDivElement>) => {
                 const viewport = e.currentTarget.querySelector(
                   "[data-radix-scroll-area-viewport]"
@@ -505,45 +728,52 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
               }}
             >
               <div data-viewport>
-                <div style={{ height: totalRows * ROW_HEIGHT, position: "relative" }}>
+                <div style={{ height: pageRowCount * ROW_HEIGHT, position: "relative" }}>
                   {rowNumbers.map((row) => {
-                    const rowOffset = row * BYTES_PER_ROW;
+                    const rowOffset = row * bytesPerRow;
                     return (
                       <div
                         key={row}
                         className="absolute left-0 right-0 flex items-center font-mono text-xs select-none"
-                        style={{ top: row * ROW_HEIGHT, height: ROW_HEIGHT }}
+                        style={{ top: (row - pageStartRow) * ROW_HEIGHT, height: ROW_HEIGHT }}
                       >
                         <span className="text-muted-foreground pr-4 pl-2 w-28 text-right shrink-0">
                           {toHexOffset(rowOffset)}
                         </span>
                         <div className="flex gap-0">
-                          {Array.from({ length: BYTES_PER_ROW }, (_, col) => {
+                          {Array.from({ length: bytesPerRow }, (_, col) => {
                             const off = rowOffset + col;
                             if (off >= size) {
                               return (
                                 <span key={col} className="w-7 shrink-0" />
                               );
                             }
-                            const value = getByte(row, col);
+                            const value = getByte(off);
                             const edited = editsRef.current.has(off);
                             const isSelected = selectedOffset === off;
+                            const isSearchMatch = searchMatchOffset === off;
+                            const isBookmarked = bookmarks.includes(off);
                             return (
                               <button
                                 key={col}
                                 type="button"
-                                className="w-7 shrink-0 text-center rounded-sm cursor-pointer hover:bg-accent focus:outline-none"
+                                aria-label={`Offset ${toHexOffset(off)}, byte ${value === null ? "loading" : toHex(value)}`}
+                                className={cn(
+                                  "w-7 shrink-0 rounded-sm text-center focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                                  value === null && "text-transparent",
+                                  edited ? "font-semibold text-amber-700" : colorCoding && value !== null ? byteTypeColor(value) : "text-foreground"
+                                )}
                                 style={{
-                                  color: edited
-                                    ? "hsl(38 92% 50%)"
-                                    : value === null
-                                    ? "transparent"
-                                    : undefined,
-                                  backgroundColor: isSelected
+                                  backgroundColor: isSearchMatch
+                                    ? "hsl(151 60% 42% / 0.16)"
+                                    : isSelected
                                     ? "hsl(var(--primary) / 0.15)"
                                     : undefined,
                                   outline: isSelected
                                     ? "1px solid hsl(var(--primary))"
+                                    : undefined,
+                                  boxShadow: isBookmarked
+                                    ? "inset 0 -2px hsl(300 70% 55%)"
                                     : undefined,
                                 }}
                                 onClick={() => {
@@ -562,11 +792,22 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
                           })}
                         </div>
                         <div aria-label="ASCII preview" className="ml-3 flex shrink-0 border-l pl-3 font-mono text-muted-foreground">
-                          {Array.from({ length: BYTES_PER_ROW }, (_, col) => {
+                          {Array.from({ length: bytesPerRow }, (_, col) => {
                             const off = rowOffset + col;
                             if (off >= size) return null;
-                            const value = getByte(row, col);
-                            return <span key={col} className="w-[0.65rem] text-center">{value === null ? "·" : toAscii(value)}</span>;
+                            const value = getByte(off);
+                            const edited = editsRef.current.has(off);
+                            return (
+                              <span
+                                key={col}
+                                className={cn(
+                                  "w-[0.65rem] text-center",
+                                  edited ? "font-semibold text-amber-700" : colorCoding && value !== null ? byteTypeColor(value) : "text-foreground"
+                                )}
+                              >
+                                {value === null ? "·" : toAscii(value)}
+                              </span>
+                            );
                           })}
                         </div>
                       </div>
@@ -574,7 +815,9 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
                   })}
                 </div>
               </div>
-            </ScrollArea>
+              <ScrollBar orientation="horizontal" />
+              </ScrollArea>
+            </div>
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel defaultSize={isMobile ? 45 : 35} minSize={20}>
@@ -597,11 +840,8 @@ export function HexEditor({ session, onDiscard }: HexEditorProps) {
                         {(() => {
                           const edit = editsRef.current.get(selectedOffset);
                           if (edit) return `${toHex(edit.current)} (edited)`;
-                          const rowKey = Math.floor(selectedOffset / BYTES_PER_ROW);
-                          const data = rows.get(rowKey);
-                          if (!data) return "loading…";
-                          const v = data[selectedOffset % BYTES_PER_ROW];
-                          return v === undefined ? "—" : toHex(v);
+                          const value = getByte(selectedOffset);
+                          return value === null ? "loading…" : toHex(value);
                         })()}
                       </dd>
                     </div>
