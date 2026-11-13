@@ -1,6 +1,8 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import useSWR from "swr";
 import {
   ArrowDownToLine,
   ArrowRight,
@@ -17,10 +19,18 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { HexEditor } from "@/components/hex-editor";
-import { discardSession, uploadFile, SessionInfo } from "@/lib/api";
+import { discardSession, getSessionMeta, uploadFile, SessionInfo } from "@/lib/api";
 import { formatBytes } from "@/lib/hex";
 
 const MAX_UPLOAD_BYTES = 800 * 1024 * 1024;
+
+function parseHexOffset(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().replace(/^0x/i, "");
+  if (!/^[0-9a-f]+$/i.test(normalized)) return undefined;
+  const offset = Number.parseInt(normalized, 16);
+  return Number.isSafeInteger(offset) ? offset : undefined;
+}
 
 const highlights = [
   {
@@ -45,6 +55,22 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const linkedSessionId = searchParams.get("session");
+  const offsetFromUrl = parseHexOffset(searchParams.get("offset"));
+  const { data: linkedSession, error: linkError } = useSWR<SessionInfo>(
+    linkedSessionId ? `byteforge-session:${linkedSessionId}` : null,
+    () => getSessionMeta(linkedSessionId as string),
+    { revalidateOnFocus: false, shouldRetryOnError: false }
+  );
+  const activeSession = session ?? linkedSession ?? null;
+
+  useEffect(() => {
+    if (!linkError) return;
+    toast.error("This file link has expired. Upload the file again to continue.");
+    router.replace("/", { scroll: false });
+  }, [linkError, router]);
 
   const handleFile = useCallback(async (file: File) => {
     if (!file.size) {
@@ -59,6 +85,7 @@ export default function Home() {
     try {
       const info = await uploadFile(file);
       setSession(info);
+      router.replace(`/?session=${encodeURIComponent(info.session_id)}`, { scroll: false });
       toast.success(`Loaded ${info.filename} · ${formatBytes(info.size)}`);
     } catch (err) {
       const reason = err instanceof TypeError
@@ -68,22 +95,23 @@ export default function Home() {
     } finally {
       setUploading(false);
     }
-  }, []);
+  }, [router]);
 
   const handleDiscard = useCallback(async () => {
-    if (!session) return;
+    if (!activeSession) return;
     try {
-      await discardSession(session.session_id);
+      await discardSession(activeSession.session_id);
     } catch {
       // Session expiry makes cleanup best-effort.
     }
     setSession(null);
-  }, [session]);
+    router.replace("/", { scroll: false });
+  }, [activeSession, router]);
 
-  if (session) {
+  if (activeSession) {
     return (
       <main className="flex h-screen flex-col overflow-hidden bg-background">
-        <HexEditor session={session} onDiscard={handleDiscard} />
+        <HexEditor session={activeSession} onDiscard={handleDiscard} initialOffset={offsetFromUrl} />
       </main>
     );
   }
